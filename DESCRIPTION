@@ -1,0 +1,55 @@
+Type: Compendium
+Package: Code for 'Survey methods for estimating the size
+    of weak-tie networks...'
+Title: Replication Code 
+Version: 0.0.1
+Authors@R: 
+    person(given = "Dennis",
+           family = "Feehan",
+           role = c("aut", "cre"),
+           email = "feehan@berkeley.edu")
+Description: Compendium description 
+License: MIT + file LICENSE 
+Depends: 
+    combinat,
+    devtools,
+    dplyr,
+    expm,
+    fastDummies,
+    functional,
+    future,
+    furrr,
+    ggraph,
+    ggrepel,
+    ggthemes,
+    glue,
+    gridExtra,
+    gt,
+    gtsummary,
+    haven,
+    here,
+    httr,
+    igraph,
+    knitr,
+    latex2exp,
+    lazyeval,
+    nrsimulatr,
+    patchwork,
+    purrr,
+    R.matlab,
+    readxl,
+    rmarkdown,
+    rstan,
+    scales,
+    stringr,
+    survey,
+    tictoc,
+    tidybayes,
+    tidygraph,
+    tidyverse
+Remotes: 
+    dfeehan/surveybootstrap@9ba432c,
+    dfeehan/networkreporting@27acedc,
+    dfeehan/nrsimulatr@f539c54
+Encoding: UTF-8
+LazyData: true

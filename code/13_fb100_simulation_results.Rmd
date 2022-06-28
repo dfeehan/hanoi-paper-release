@@ -1,0 +1,281 @@
+---
+title: "FB100 Simulation results"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setglobal, tidy=FALSE, echo=FALSE}
+library(knitr)
+
+opts_chunk$set(out.width=600, out.height=600)
+library(tidyverse)
+library(stringr)
+
+library(patchwork)
+
+library(here)
+```
+
+```{r dirs}
+root.dir <- here()
+
+data.out.dir <- file.path(root.dir, "data", "sim")
+out.dir <- file.path(root.dir, "out", "sim")
+```
+
+```{r}
+# load nr.censuses
+nr.censuses <- readRDS(file=file.path(data.out.dir, "fb100_censuses_perfect.rds"))
+# load num.cand.gps
+num.cand.gps <- readRDS(file=file.path(data.out.dir, "fb100_svy_num_cand_gps.rds"))
+# load simulated survey results
+svy.sim.out <- readRDS(file=file.path(data.out.dir, "fb100_svy_sims.rds"))
+```
+
+## Compare KP and new estimator
+
+```{r}
+estimator.comp <- svy.sim.out %>%
+  select(dbar.hat, kp.dbar.hat, gp.set.idx, school, true.dbar, estimand.dbar) %>%
+  tidyr::gather(estimator, estimate, dbar.hat:kp.dbar.hat) %>% 
+  mutate(estimator.err = estimate - true.dbar,
+         rel.err = (estimate - true.dbar) / true.dbar,
+         # this is how far the estimand is from the truth
+         estimand.err = estimand.dbar - true.dbar,
+         # this is how far the estimate is from the estimand
+         err.to.estimand = estimate - estimand.dbar)
+
+estimator.comp
+```
+
+```{r}
+estimator.comp.twopanel <- 
+  ggplot(estimator.comp %>% 
+           mutate(estimator=dplyr::recode(estimator,
+                                          `dbar.hat`="Using respondents\nto estimate\nprobe gp. sizes",
+                                          `kp.dbar.hat`="Using known\nprob gp. sizes"))) +
+  xlab("Relative error in\nestimated avg. network size") +
+  geom_histogram(aes(x=rel.err)) +
+  geom_vline(aes(xintercept=0), lty='dashed', color='blue') +
+  facet_grid(~ estimator) +
+  theme_minimal()
+
+ggsave(file.path(out.dir, "new-kp-re-hist-twopanel.pdf"), estimator.comp.twopanel)
+# this might be a little easier (not as big a file)
+ggsave(file.path(out.dir, "new-kp-re-hist-twopanel.png"), estimator.comp.twopanel, dpi=100)
+
+estimator.comp.twopanel
+```
+
+
+
+```{r}
+estimator.err.comp <- svy.sim.out %>%
+  mutate(rel.err.kp.dbar.hat = (kp.dbar.hat-true.dbar)/true.dbar,
+         rel.err.dbar.hat = (dbar.hat-true.dbar)/true.dbar,
+         rel.err.new.minus.kp = rel.err.dbar.hat - rel.err.kp.dbar.hat,
+         err.kp.dbar.hat = kp.dbar.hat - true.dbar,
+         err.dbar.hat = dbar.hat - true.dbar,
+         err.topg.kp.dbar.hat = kp.dbar.hat - estimand.dbar,
+         err.topg.dbar.hat = dbar.hat - estimand.dbar,
+         err.estimand = estimand.dbar - true.dbar,
+         frac.err.kp.dbar.hat = err.topg.kp.dbar.hat / err.kp.dbar.hat,
+         frac.err.dbar.hat = err.topg.dbar.hat / err.dbar.hat)
+```
+
+
+```{r}
+new.kp.re.scatter <- ggplot(estimator.err.comp) +
+  geom_point(aes(x=rel.err.kp.dbar.hat,
+                 y=rel.err.dbar.hat),
+  #geom_point(aes(x=abs(rel.err.kp.dbar.hat),    
+         alpha=.01) +
+  #xlim(0,1) + ylim(0,1) +
+  xlim(-1,1) + ylim(-1,1) +
+  #geom_smooth(aes(x=rel.err.kp.dbar.hat,
+  #                y=rel.err.dbar.hat)) +
+  xlab("Relative error in\nknown population estimator") +
+  ylab("Relative error in new estimator") +
+  coord_equal() + 
+  geom_abline(intercept=0, slope=1, color='darkgrey') +
+  theme_minimal()
+
+ggsave(file.path(out.dir, "new-kp-re-scatter.pdf"), new.kp.re.scatter)
+# this might be a little easier (not as big a file), dpi=100
+ggsave(file.path(out.dir, "new-kp-re-scatter.png"), new.kp.re.scatter, dpi=50)
+
+new.kp.re.scatter
+```
+```{r}
+cat(glue::glue("
+
+      Correlation between relative error from kp estimator and relative error from new estimator: 
+      {round(thiscor,2)}
+      
+      ", thiscor=cor(estimator.err.comp$rel.err.kp.dbar.hat, estimator.err.comp$rel.err.dbar.hat)))
+```
+
+Combine the two plots above into a single figure for the paper
+
+```{r}
+re_combined_fig <- estimator.comp.twopanel +
+  new.kp.re.scatter +
+  plot_annotation(tag_prefix='(',
+                  tag_suffix=')',
+                  tag_levels='a') 
+
+ggsave(file.path(out.dir, "new-kp-re-combined.pdf"), re_combined_fig)
+# this might be a little easier (not as big a file)
+ggsave(file.path(out.dir, "new-kp-re-combined.png"), re_combined_fig, dpi=100)
+
+re_combined_fig
+```
+
+
+
+```{r}
+re.mean.kp <- mean(estimator.err.comp$rel.err.kp.dbar.hat)
+re.sd.kp <- sd(estimator.err.comp$rel.err.kp.dbar.hat)
+
+re.mean.new <- mean(estimator.err.comp$rel.err.dbar.hat)
+re.sd.new <- sd(estimator.err.comp$rel.err.dbar.hat)
+
+glue::glue("
+mean rel-error (sd) for kp method: {re.mean.kp} ({re.sd.kp})\n\n
+mean rel-error (sd) for new method: {re.mean.new} ({re.sd.new})\n\n
+")
+
+re.tab <- tribble(~ estimator, ~ mean_re, ~sd_re,
+                  'kp',      re.mean.kp, re.sd.kp,
+                  'new',     re.mean.new, re.sd.new)
+
+saveRDS(re.tab, file.path(out.dir, "design_sim_re_table.rds"))
+```
+
+
+```{r}
+re.diff <- ggplot(estimator.err.comp) +
+  geom_histogram(aes(x=rel.err.new.minus.kp), binwidth=.005) +
+  geom_vline(aes(xintercept=0), color='blue') +
+  geom_vline(aes(xintercept=mean(rel.err.new.minus.kp)), color='red') +
+  theme_minimal()
+
+ggsave(file.path(out.dir, "new-kp-re-diff.pdf"), re.diff)
+ggsave(file.path(out.dir, "new-kp-re-diff.png"), re.diff)
+
+re.diff
+```
+
+
+## BELOW HERE FOR R+R
+
+
+Goal: reviewer asks for evidence if there is any cancellation of bias in estimating probe group size
+
+
+**Update: I think the reviewer was really focused on the estimated probe group sizes from the model. So I'm turning to that file, 15_fb100_fit_degree_model.Rmd**
+
+Relevant data:
+
+* num.cand.gps has, for each school, the size (prevalence) of each candidate group. This is in a list column called prev.df
+* svy.sim.out has, for each result, the list of groups in the list column 'gp.set'. Note that there is also 'gp.set.idx' and all of the groups are the same w/in each gp.set.idx
+
+```{r}
+gp.set.df <- svy.sim.out %>%
+  select(school, gp.set.idx, gp.set) %>%
+  group_by(school, gp.set.idx, gp.set) %>%
+  slice(1) %>%
+  unnest(gp.set) %>%
+  rename(group=gp.set)
+
+gp.set.df
+```
+
+
+```{r}
+all.gps <-
+  num.cand.gps %>%
+  select(school, num.nodes, num.traits, num.candidates, prev.df) %>%
+  unnest(prev.df) %>%
+  mutate(num = prev*num.nodes)
+  
+all.gps
+```
+
+Assemble a dataset with the prevalence and size of each group that is a member
+of each group set within each school.
+
+Since each group set had 10 groups, there were 20 group sets, and there are 100 schools,
+we expect 10 * 20 * 100 = 20,000 rows here
+
+```{r}
+gp.set.gps.df <-
+  gp.set.df %>%
+  left_join(all.gps %>%
+              select(school, group, prev, size=num))
+
+saveRDS(gp.set.gps.df,
+        file=file.path(data.out.dir, "gp_set_sizes.rds"))
+
+gp.set.gps.df
+```
+
+
+Get the total true size of each set of probe groups; we'll use this to evaluate
+the estimated size from the simulated surveys
+
+```{r}
+gp.set.size.df <-
+  gp.set.gps.df %>%
+  group_by(school, gp.set.idx) %>%
+  summarize(size = sum(size),
+            prev = sum(prev))
+
+gp.set.size.df
+```
+
+Join the total size of the group sets onto the survey results
+
+```{r}
+svy.sim.out.with.gpset.size <- svy.sim.out %>%
+  left_join(gp.set.size.df %>% select(school, gp.set.idx, gp.set.size=size))
+            
+svy.sim.out.with.gpset.size            
+```
+
+```{r}
+svy.sim.out.with.gpset.size %>%
+  ggplot(.) +
+  geom_point(aes(x=gp.set.size, y=probe.size.hat), alpha=.3) +
+  geom_abline(intercept=0, slope=1, color='grey') +
+  xlab("True size of probe groups") +
+  ylab("Estimated size of probe groups") +
+  theme_minimal()
+```
+
+```{r}
+gp.set.estimator.err.comp <- svy.sim.out.with.gpset.size %>%
+  mutate(rel.err.gpset.hat = (probe.size.hat-gp.set.size)/gp.set.size,
+         err.gpset.hat = probe.size.hat - gp.set.size)
+```
+
+
+```{r}
+re.mean.gpset.new <- mean(gp.set.estimator.err.comp$rel.err.gpset.hat)
+re.sd.gpset.new <- sd(gp.set.estimator.err.comp$rel.err.gpset.hat)
+
+glue::glue("
+mean rel-error (sd) for kp method: ---\n\n
+mean rel-error (sd) for new method: {re.mean.new} ({re.sd.new})\n\n
+")
+
+re.tab <- tribble(~ estimator, ~ mean_re, ~sd_re,
+                  'kp',      NA, NA,
+                  'new',     re.mean.gpset.new, re.sd.gpset.new)
+
+saveRDS(re.tab, file.path(out.dir, "design_sim_re_gpset_table.rds"))
+```

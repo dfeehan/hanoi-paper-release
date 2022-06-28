@@ -1,0 +1,240 @@
+---
+title: "Compare KP and new model fits to fb100 simulations"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setglobal, tidy=FALSE, echo=FALSE}
+library(knitr)
+
+opts_chunk$set(out.width=600, out.height=600)
+library(tidyverse)
+library(stringr)
+library(igraph)
+#library(expm)
+library(combinat)
+library(ggraph)
+library(gridExtra)
+library(ggthemes)
+#library(ggnetwork)
+
+library(patchwork)
+
+library(R.matlab)
+
+library(tidygraph)
+library(nrsimulatr)
+
+library(furrr)
+
+options(mc.cores = parallel::detectCores())
+library(rstan)
+rstan_options(auto_write = TRUE)
+
+library(tidybayes)
+
+library(tictoc)
+library(here)
+
+```
+
+
+
+```{r dirs}
+root.dir <- here()
+
+code.dir <- file.path(root.dir, 'code')
+
+data.out.dir <- file.path(root.dir, "data", "sim")
+out.dir <- file.path(root.dir, "out", "sim")
+
+model.estprobe.out.dir <- file.path(out.dir, 'rdestprobe')
+model.knownprobe.out.dir <- file.path(out.dir, 'rdknownprobe')
+```
+
+```{r}
+# load nr.censuses
+nr.censuses <- readRDS(file=file.path(data.out.dir, "fb100_censuses_perfect.rds"))
+# load num.cand.gps
+num.cand.gps <- readRDS(file=file.path(data.out.dir, "fb100_svy_num_cand_gps.rds"))
+# load simulated survey results
+svy.sim.out <- readRDS(file=file.path(data.out.dir, "fb100_svy_sims.rds"))
+```
+
+
+```{r}
+svy_models_kp <- readRDS(file=file.path(model.knownprobe.out.dir, 
+                                        'svy_models_degree_post_10perschool.rds')) %>%
+  mutate(model = 'model_kp')
+svy_models_new <- readRDS(file=file.path(model.estprobe.out.dir, 
+                                         'svy_models_degree_post_10perschool.rds')) %>%
+  mutate(model = 'model_new')
+```
+
+```{r}
+model_comp <- bind_rows(bind_rows(svy_models_kp),
+                        bind_rows(svy_models_new))
+model_comp
+```
+
+```{r}
+saveRDS(model_comp, file.path(out.dir, "kp_vs_new_model_comp.rds"))
+```
+
+```{r}
+model_comp_wide <- model_comp %>%
+  pivot_wider(values_from=starts_with('post_mean_degree'),
+              names_from='model')
+
+model_comp_wide
+```
+
+```{r}
+model_comp_wide %>%
+  ggplot(.) +
+  geom_point(aes(x=post_mean_degree_median_model_kp,
+                 y=post_mean_degree_median_model_new),
+             alpha=.3) +
+  geom_abline(intercept=0, slope=1) +
+  theme_minimal()
+```
+
+```{r}
+cur.schools <- unique(svy.sim.out$school)
+cur.gp.set.idxes <- c(1)
+cur.svy.idxes <- 1:10
+
+true_dbar <- svy.sim.out %>%
+       filter(school %in% cur.schools,
+              gp.set.idx %in% cur.gp.set.idxes,
+              svy.index %in% cur.svy.idxes) %>%
+  select(school, gp.set.idx, svy.index, estimand.dbar, kp.dbar.hat, true.dbar)
+
+model_comp_true <- model_comp_wide %>%
+  left_join(true_dbar)
+
+model_comp_true
+```
+
+
+```{r}
+model_comp_true_long <- model_comp_true %>%
+  select(school, gp.set.idx, svy.index,
+         post_mean_degree_median_model_kp, post_mean_degree_median_model_new, true.dbar) %>%
+  #pivot_longer(cols=post_mean_degree_median_model_kp:true.dbar,
+  pivot_longer(cols=post_mean_degree_median_model_kp:post_mean_degree_median_model_new,
+               names_to='model_name',
+               values_to='value') %>%
+  mutate(model_name = case_when(str_detect(model_name, 'model_kp') ~ 'model_kp',
+                                str_detect(model_name, 'model_new') ~ 'model_new',
+                                str_detect(model_name, 'true.dbar') ~ 'truth',
+                                TRUE ~ NA_character_)) %>%
+  mutate(rel_err = (value - true.dbar) / true.dbar)
+  
+model_comp_true_long
+```
+
+
+```{r}
+mctlw <- model_comp_true_long %>%
+  pivot_wider(-true.dbar,
+              values_from=c('rel_err', 'value'),
+              names_from='model_name')
+mctlw
+```
+
+```{r}
+plot_comp_re <- ggplot(mctlw) +
+  geom_point(aes(y=rel_err_model_new,
+                 x=rel_err_model_kp), alpha=.3) +
+  geom_abline(intercept=0, slope=1) +
+  xlab("Relative error from KP model") +
+  ylab("Relative error from new model") +
+  theme_minimal()
+
+cat(glue::glue("
+
+      Correlation between relative error from kp model and relative error from new model: 
+      {round(thiscor,2)}
+      
+      ", thiscor=cor(mctlw$rel_err_model_kp, mctlw$rel_err_model_new)))
+
+ggsave(filename=file.path(out.dir, 'model_kpnew_re_scatter.pdf'),
+       plot=plot_comp_re)
+ggsave(filename=file.path(out.dir, 'model_kpnew_re_scatter.png'),
+       plot=plot_comp_re)
+
+plot_comp_re
+```
+
+
+```{r}
+plot_hist_re <- 
+  model_comp_true_long %>%
+  mutate(model_name = case_when(model_name == 'model_kp' ~ 'KP model',
+                                model_name == 'model_new' ~ 'New model')) %>%
+  ggplot(.) +
+  geom_histogram(aes(x=rel_err)) +
+  geom_vline(aes(xintercept=0), lty='dashed', color='blue') +
+  facet_grid(~ model_name) +
+  xlab("Relative error in estimated avg. network size") +
+  theme_minimal()
+
+
+ggsave(filename=file.path(out.dir, 'model_kpnew_re_hist.pdf'),
+       plot=plot_hist_re)
+ggsave(filename=file.path(out.dir, 'model_kpnew_re_hist.png'),
+       plot=plot_hist_re)
+
+plot_hist_re
+```
+
+Combine the previous two figures into one two-paneled figure
+
+```{r}
+kpnew_combined_fig <- plot_hist_re + 
+  plot_comp_re +
+  plot_annotation(tag_prefix='(',
+                  tag_suffix=')',
+                  tag_levels='a')
+
+ggsave(filename=file.path(out.dir, "model-kpnew-re-combined.pdf"), 
+       width=6, height=3, units='in',
+       plot=kpnew_combined_fig)
+# this might be a little easier (not as big a file)
+ggsave(filename=file.path(out.dir, "model-kpnew-re-combined.png"), 
+       width=6, height=3, units='in',
+       plot=kpnew_combined_fig)
+
+kpnew_combined_fig
+```
+
+
+Write out a table...
+
+```{r}
+re.mean.kp <- mean(mctlw$rel_err_model_kp)
+re.sd.kp <-     sd(mctlw$rel_err_model_kp)
+
+re.mean.new <- mean(mctlw$rel_err_model_new)
+re.sd.new   <-   sd(mctlw$rel_err_model_new)
+
+glue::glue("
+mean rel-error (sd) for kp method: {re.mean.kp} ({re.sd.kp})\n\n
+mean rel-error (sd) for new method: {re.mean.new} ({re.sd.new})\n\n
+")
+
+re.model.tab <- tribble(~ estimator, ~ mean_re, ~sd_re,
+                        'kp',      re.mean.kp, re.sd.kp,
+                        'new',     re.mean.new, re.sd.new)
+
+saveRDS(re.model.tab, file.path(out.dir, "model_sim_re_table.rds"))
+```
+
+
+
+
+

@@ -1,0 +1,99 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(patchwork)
+library(here)
+library(latex2exp)
+```
+
+```{r}
+root.dir <- here()
+
+out.dir <- file.path(root.dir, "out")
+```
+
+```{r}
+fn_alpha <- function(x, k1) {
+  return(exp(-k1*x)) 
+}
+
+# omega(k2) = [1 - sigma(k2)]
+fn_omega <- function(x, k2) {
+  return(1 - exp(-k2*x)) 
+}
+
+fn_tau <- function(x, k1, k2) {
+  return(fn_alpha(x, k1) * fn_omega(x, k2))
+}
+
+fn_tau_max <- function(k1, k2) {
+  return((1/k2)*log((k1+k2)/k1))
+}
+```
+
+```{r}
+# blue
+cur_k1 <- .3
+# red
+cur_k2 <- .1
+
+plot_params <- function(cur_k1, cur_k2) {
+  
+  xstar <- fn_tau_max(cur_k1, cur_k2)
+  
+  resplot <- ggplot() +
+    # alpha is blue
+    geom_function(fun=fn_alpha, args=list(k1=cur_k1), aes(color='alpha', lty='alpha')) +
+    # omega (= 1 - sigma) is red
+    geom_function(fun=fn_omega, args=list(k2=cur_k2), aes(color='omega', lty='omega')) +
+    # total is black
+    geom_function(fun=fn_tau, args=list(k1=cur_k1, k2=cur_k2), aes(color='tau', lty='tau')) +
+    # max
+    geom_vline(xintercept=xstar, lty=3) +
+    theme_minimal() +
+    xlab("tie strength (t)") +
+    ylab("") +
+    ggtitle(TeX(glue::glue("$K_1 = {cur_k1}$;  $K_2 = {cur_k2}$"))) +
+    scale_color_manual("", 
+                       values = c('alpha' = 'blue', 'omega'='red', 'tau'='black'),
+                       labels=list(TeX('$\\alpha(t)$'), TeX('$1-\\sigma(t)$'), TeX('$\\tau(t)$'))) +
+    scale_linetype_manual("", 
+                          values = c('alpha' = 2, 'omega'=2, 'tau'=1),
+                          labels=list(TeX('$\\alpha(t)$'), TeX('$1-\\sigma(t)$'), TeX('$\\tau(t)$'))) +
+    xlim(0,8)
+
+  return(resplot)
+}
+
+plot_params(.1,.1)
+```
+```{r}
+plts <- expand_grid(cur_k1 = c(.1, .5, .9),
+            cur_k2 = c(.1, .5, .9)) %>%
+  pmap(plot_params)
+
+plts
+```
+
+
+```{r}
+fig.height <- 6
+fig.width <- 6
+
+all_plots <- wrap_plots(plts, 
+                        guides="collect",
+                        nrow=3, ncol=3) &
+  theme(legend.position='bottom')
+
+ggsave(filename=file.path(out.dir, 'tau_model_examples.pdf'),
+       plot=all_plots,
+       height=fig.height,
+       width=fig.width)
+
+all_plots
+```
+

@@ -1,0 +1,1561 @@
+---
+title: "Calculate estimates from Hanoi survey"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(stringr)
+library(networkreporting)
+library(ggrepel)
+library(patchwork)
+library(gridExtra)
+
+library(latex2exp)
+
+options(mc.cores = 8)
+library(rstan)
+rstan_options(auto_write = TRUE)
+library(tidybayes)
+
+library(tictoc)
+library(here)
+```
+
+
+```{r dirs}
+root.dir <- here()
+
+data.dir <- file.path(root.dir, 'data', 'survey')
+code.dir <- file.path(root.dir, 'code')
+out.dir <- file.path(root.dir, "out", "survey")
+```
+
+Load the data
+
+```{r}
+svy <- read_csv(file.path(data.dir, 'hanoi_survey.csv'))
+analysisweights <- read_csv(file.path(data.dir, 'hanoi_analysis_weights.csv'))
+
+hm_varmap_df <- read_csv(file.path(data.dir,  'varmap_hm.csv'))
+all_varmap_df <- read_csv(file.path(data.dir, 'varmap_all.csv'))
+
+# TODO load frame population estimate
+
+## NB: is this right?
+hp_varmap_df <- all_varmap_df %>% anti_join(hm_varmap_df)
+```
+
+Load the population projection data.
+
+```{r}
+## these projections are from the table on pg 88 of the file I was sent
+popn_dat <- read_csv(file.path(data.dir, "hanoi_projection_2017.csv"))
+
+# get the right order for the factor of age categories
+tmp <- popn_dat %>% filter(sex == 'both') 
+tmp$age <- fct_inorder(tmp$age)
+popn_dat <- popn_dat %>% mutate(age = factor(age, levels=levels(tmp$age)))
+```
+
+```{r}
+## crude: assume 40% of people in age group 15-19 are 18-19
+popn_dat <- popn_dat %>%
+  mutate(frame.sum.wt = ifelse(age %in% c('0-4', '5-9', '10-14',
+                                          '55-59', '60-64', '65-69', 
+                                          '70-74', '75-79', '80+'),
+                               0,
+                               ifelse(age %in% c('15-19'),
+                                      0.4,
+                                      1)))
+
+## about 4 million people in frame population
+N.F <- popn_dat %>%
+  filter(sex != 'both') %>%
+  summarize(tot = sum(frame.sum.wt*estimate)) %>%
+  pull(tot)
+
+## about 7.3 million people in Hanoi overall 
+N <- popn_dat %>%
+  filter(sex != 'both') %>%
+  summarize(tot = sum(estimate)) %>%
+  pull(tot)
+
+frame_popn_dat <- popn_dat %>%
+  filter(sex != 'both') %>%
+  filter(frame.sum.wt > 0) %>%
+  mutate(agecat = paste(age),
+         agecat = ifelse(agecat == '15-19', '18-24', agecat),
+         agecat = ifelse(agecat == '20-24', '18-24', agecat)) %>%
+  group_by(agecat, sex) %>%
+  #summarize(frame_est_base = sum(estimate * frame.sum.wt)) %>%
+  #select(sex, agecat, frame_est_base) 
+  summarize(frame_est = sum(estimate * frame.sum.wt),
+            .groups='drop') %>%
+  mutate(frame_est_frac = frame_est / sum(frame_est))  %>%
+  select(sex, agecat, frame_est_frac) 
+```
+
+
+## Respondent profiles
+
+```{r resp-profile}
+fig.height <- 3
+fig.width <- 6
+
+## frame was adults aged 18-55
+resp.plot <- ggplot(svy) + 
+  geom_histogram(aes(x=age, fill=gender), binwidth=1) + 
+  theme_minimal() + 
+  #facet_grid(gender ~ .) +
+  facet_grid(~ gender) +
+  xlab("Respondent age") +
+  ylab("Number of respondents") + 
+  #ggtitle("Respondent profile (unweighted)") +
+  theme(legend.position='none')
+
+ggsave(filename=file.path(out.dir, "respondent-profile.pdf"),
+       plot=resp.plot,
+       height=fig.height,
+       width=fig.width)
+ggsave(filename=file.path(out.dir, "respondent-profile.png"),
+       plot=resp.plot,
+       height=fig.height,
+       width=fig.width)
+
+resp.plot
+```
+
+
+```{r}
+resp_weight_frac <- svy %>% 
+  select(sex=gender, age, weight, weight_raw) %>%
+  mutate(agecat = cut(age,
+                   #breaks=c(18, seq(from=20, to=54, by=5), right=FALSE)))
+                   breaks=c(0, seq(from=20, to=55, by=5)), 
+                   right=FALSE))  %>%
+  mutate(agecat = fct_recode(agecat, 
+                             '18-19'='[0,20)',
+                             '20-24'='[20,25)',
+                             '25-29'='[25,30)',
+                             '30-34'='[30,35)',
+                             '35-39'='[35,40)',
+                             '40-44'='[40,45)',
+                             '45-49'='[45,50)',
+                             '50-54'='[50,55)')) %>%
+  mutate(sex = ifelse(sex == 'Male', 'male', 'female')) %>%
+  group_by(agecat, sex) %>%
+  summarize(wgt_tot = sum(weight),
+            raw_wgt_tot = sum(weight_raw),
+            .groups='drop') %>%
+  mutate(wgt_frac = wgt_tot / sum(wgt_tot),
+         raw_wgt_frac = raw_wgt_tot / sum(raw_wgt_tot)) %>%
+  select(agecat, sex, wgt_frac, raw_wgt_frac)
+```
+
+```{r}
+wplot.fig.height <- 4.5
+wplot.fig.width <- 4 
+
+# calculate the sum of the raw survey weights by sex and by age group
+resp_comp <- resp_weight_frac %>%
+  ungroup() %>%
+  mutate(agecat = paste(agecat)) %>%
+  mutate(agecat = ifelse(agecat == '18-19', '18-24', agecat),
+         agecat = ifelse(agecat == '20-24', '18-24', agecat)) %>%
+  group_by(agecat, sex) %>%
+  summarize(raw_wgt_frac = sum(raw_wgt_frac),
+            wgt_frac = sum(wgt_frac)) %>%
+  ungroup() %>%
+  left_join(frame_popn_dat, by=c('sex', 'agecat'))
+
+## plot cell size from projection (x axis) and
+##      cell size from sum of raw survey weights (y axis)
+resp.comp.plot <-  
+  resp_comp %>%
+  ggplot(.) +
+  # y: sum of survey weights in each age-sex group
+  # x: the number of people in the population expected in the age-sex group if
+  #    the projection age/sex distribution is applied to the number of people implied
+  #    by the survey weights
+  geom_point(aes(x=frame_est_frac, y=raw_wgt_frac, color=sex)) +
+  geom_text_repel(aes(x=frame_est_frac, y=raw_wgt_frac, label=agecat)) +
+  geom_abline(aes(slope = 1, intercept=0)) +
+  geom_abline(aes(slope = 1.2, intercept=0), color='grey') +
+  geom_abline(aes(slope = .8, intercept=0), color='grey') +
+  expand_limits(x=0, y=0) + 
+  xlab('Population projection estimate') +
+  ylab('Survey weights') +
+  scale_y_continuous(label=scales::percent) +
+  scale_x_continuous(label=scales::percent) +
+  coord_equal() +
+  theme_minimal() +
+  theme(legend.position='bottom')
+
+resp.comp.plot
+
+ggsave(filename=file.path(out.dir, 'weight_frame_comp.pdf'),
+       plot=resp.comp.plot,
+       height=wplot.fig.height,
+       width=wplot.fig.width)
+ggsave(filename=file.path(out.dir, 'weight_frame_comp.png'),
+       plot=resp.comp.plot,
+       height=wplot.fig.height,
+       width=wplot.fig.width)
+```
+
+```{r}
+# NB: these are set above
+#wplot.fig.height <- 4.5
+#wplot.fig.width <- 4 
+
+
+## plot cell size from projection (x axis) and
+##      cell size from sum of calibrated survey weights scaled to add up to popn projection (y axis)
+resp.comp.plot.calibrated <- 
+  ggplot(resp_comp) +
+  geom_point(aes(x=frame_est_frac, y=wgt_frac, color=sex)) +
+  geom_text_repel(aes(x=frame_est_frac, y=wgt_frac, label=agecat)) +
+  #geom_point(aes(x=rescaled_frame_est, y=wgt_tot, color=sex)) +
+  #geom_text_repel(aes(x=rescaled_frame_est, y=wgt_tot, label=agecat)) +
+  geom_abline(aes(slope = 1, intercept=0)) +
+  # the grey lines show 20% error in either direction
+  geom_abline(aes(slope = 1.2, intercept=0), color='grey') +
+  geom_abline(aes(slope = .8, intercept=0), color='grey') +
+  xlab('Population projection estimate') +
+  ylab('Calibrated survey weights') +
+  expand_limits(x=0, y=0) + 
+  scale_y_continuous(label=scales::percent) +
+  scale_x_continuous(label=scales::percent) +
+  coord_equal() +
+  theme_minimal() +
+  theme(legend.position='bottom')
+
+resp.comp.plot.calibrated
+
+#ggsave(filename=file.path(fig.out.dir, 'weight_frame_comp_calibrated.pdf'),
+#       plot=resp.comp.plot.calibrated,
+#       height=wplot.fig.height,
+#       width =wplot.fig.width)
+
+```
+
+```{r}
+
+resp.comp.plot.both <- resp.comp.plot + 
+  resp.comp.plot.calibrated +
+  plot_annotation(tag_prefix='(',
+                  tag_suffix=')',
+                  tag_levels='a')  
+
+ggsave(filename=file.path(out.dir, 'weight_frame_comp_raw_calib.pdf'),
+       plot=resp.comp.plot.both,
+       height=wplot.fig.height,
+       width=2*wplot.fig.width)
+ggsave(filename=file.path(out.dir, 'weight_frame_comp_raw_calib.png'),
+       plot=resp.comp.plot.both,
+       height=wplot.fig.height,
+       width=2*wplot.fig.width)
+
+resp.comp.plot.both
+```
+
+
+## Recodes to get nice names for several variables
+
+```{r}
+# keep track of the names of the probe groups, 
+# the different relationships, and
+probe.gps <- unique(hm_varmap_df %>% pull(group))
+hp.gps <- unique(hp_varmap_df %>% pull(group))
+nonhp.gps <- probe.gps
+probe.relations <- unique(hm_varmap_df %>% pull(relation))
+any.probe.vars <- hm_varmap_df %>% filter(relation == 'know_any') %>% pull(var)
+hm.probe.vars <- hm_varmap_df %>% filter(relation != 'know_any') %>% pull(var)
+
+# these include probe popns and hidden popns
+probe.gps <- unique(all_varmap_df %>% pull(group))
+probe.relations <- unique(all_varmap_df %>% pull(relation))
+all.hm.vars <- all_varmap_df %>% filter(relation != 'know_any') %>% pull(var)
+```
+
+Some useful recodes
+
+```{r recodes}
+## to use:
+## mutate(tie = tie_pretty(.x=tie))
+##
+
+tie_pretty <- purrr::partial(dplyr::recode,
+                             'any'='Any contact',
+                             'cc_12mo'='Conversational\ncontact',
+                             'meal_12mo'='Shared a meal\nin last 12 mo.',
+                             'meal_month'='Shared a meal\nin last month')
+qoi_pretty <- purrr::partial(dplyr::recode,
+                             'fsw'='Female Sex Workers',
+                             'msm'='Men who have\nsex with men',
+                             'drug_injectors'='People who\ninject drugs',
+                             'drug_users'='People who\nuse drugs',
+                             'women_smoke'='Women who smoke',
+                             'women_babies'='Women who had a baby\nin the past 12mo')
+
+pgrecodes <- c('doctor' = 'Doctor',
+               'lawyer' = 'Lawyer',
+               'primary_teacher' = 'Primary teacher',
+               'bank_worker' = 'Bank worker',
+               'taxi_driver' = 'Taxi driver',
+               'xe_om_driver' = 'Xe om driver',
+               'hairdresser' = 'Hairdresser',
+               'nurse' = 'Nurse',
+               'cafe_owner' = 'Coffeeshop owner',
+               'farmer' = 'Rice farmer',
+               'builder' = 'Builder/Mason',
+               'security_guard' = 'Security guard',
+               'student' = 'Student')
+
+nonhp_pretty <- purrr::partial(dplyr::recode,
+                               !!!pgrecodes)
+
+ocrecodes <-
+  c('OTHER' = 'Other',
+    'FARMER (RICE GROWER ONLY)' = 'Rice farmer',
+    'STUDENT' = 'Student',
+    'BUILDER/MASON' = 'Builder/Mason',
+    'TAXI DRIVER' = 'Taxi driver',
+    'BANK WORKER' = 'Bank worker',
+    'PRIMARY TEACCHER' = 'Primary teacher',
+    'HAIRDRESSER' = 'Hairdresser',
+    'SECURITY GUARD' = 'Security guard',
+    'LAWYER' = 'Lawyer',
+    'NURSE' = 'Nurse',
+    'XE OM DRIVER' = 'Xe om driver',
+    'COFFEESHOP OWNER' = 'Coffeeshop owner')
+
+occ_pretty <- purrr::partial(dplyr::recode, !!!ocrecodes)
+
+
+```
+
+# Plot reported size estimate for each probe group
+
+```{r}
+svy <- svy %>%
+  mutate(occupation_raw = occ_pretty(.x=a7))
+
+svy <- svy %>% mutate(occupation = fct_infreq(occupation_raw))
+
+occplot <- svy %>%
+  filter(! occupation %in% c('Other', 'Rice farmer')) %>%
+  group_by(occupation) %>%
+  summarize(num_respondents = n(),
+            size_estimate = sum(weight)) %>%
+  ggplot(.) +
+  #geom_point(aes(x=occupation, y=num_respondents)) +
+  geom_point(aes(x=occupation, y=size_estimate)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  expand_limits(y=0) +
+  xlab('') +
+  #ylab("Number of respondents") +
+  ylab("Estimated group size") +
+  scale_y_continuous(labels=scales::comma)
+
+occplot
+
+#ggsave(filename=file.path(out.dir, 'hanoi_occupations.pdf'),
+#       plot=occplot)
+
+```
+
+What fraction of respondents report being in any probe group?
+
+```{r}
+num_not_other <- sum(svy$occupation != 'Other')
+
+glue::glue("{pg_pct}% of respondents reported being in one of the probe groups",
+           pg_pct = round(100 * num_not_other / nrow(svy)))
+```
+
+
+Add uncertainty estimates
+
+```{r occupation-estimates-ci}
+svy.w.forpg <- svy %>% left_join(analysisweights, by='id')
+
+num.reps <- ncol(analysisweights) - 1
+
+pg.size.boot <- svy.w.forpg %>%
+  filter(! occupation %in% c('Other')) %>%
+  group_by(occupation) %>%
+  summarize_at(vars(starts_with('analysis_weight_')),
+               sum) %>%
+  pivot_longer(cols=-occupation,
+               names_to='dummy',
+               values_to='estimate') %>%
+  mutate(boot_idx = as.numeric(str_replace(dummy, "analysis_weight_", ""))) %>%
+  select(-dummy)
+       
+# summarize results
+pg.size.boot.agg <- pg.size.boot %>%
+  group_by(occupation) %>%
+  summarize(size_estimate_mean = mean(estimate),
+            size_estimate_ci_low = quantile(estimate, .025),
+            size_estimate_ci_high = quantile(estimate, .975),
+            size_estimate_stderr = sd(estimate))
+
+# total size of probe groups
+all.pg.size.boot <-
+  pg.size.boot %>%
+  group_by(boot_idx) %>%
+  summarize(estimate = sum(estimate))
+
+# summarize total probe group sizes
+all.pg.size.boot.summ <-
+  all.pg.size.boot %>%
+  summarize(size_estimate_mean = mean(estimate),
+            size_estimate_ci_low = quantile(estimate, .025),
+            size_estimate_ci_high = quantile(estimate, .975),
+            size_estimate_stderr = sd(estimate)) %>%
+  mutate(occupation = "All probe groups")
+
+
+# add total probe group sizes to individual probe group info
+
+pg.size.boot.agg.withtot <- pg.size.boot.agg %>%
+  mutate(is_total = 0) %>%
+  bind_rows(all.pg.size.boot.summ %>% mutate(is_total = 1)) %>%
+  mutate(occupation = fct_reorder(occupation, size_estimate_mean))
+```
+
+```{r}
+pg.size.boot.plot <-
+  pg.size.boot.agg.withtot %>%
+  #pg.size.boot.agg %>%
+  ggplot(.) +  
+  geom_pointrange(aes(x=occupation, 
+                      y=size_estimate_mean,
+                      ymin=size_estimate_ci_low,
+                      ymax=size_estimate_ci_high,
+                      color=as.factor(is_total))) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  expand_limits(y=0) +
+  xlab('') +
+  #ylab("Number of respondents") +
+  ylab("Estimated group size") +
+  scale_color_manual(values=c('0'='black', '1'='blue')) +
+  scale_y_log10(labels=scales::comma) +
+  scale_x_discrete(labels = function(x) stringr::str_wrap(x, width=15))  +
+  theme(legend.position='none')
+
+ggsave(filename=file.path(out.dir, 'hanoi_occupations.pdf'),
+       plot=pg.size.boot.plot,
+       width=6, height=4)
+
+ggsave(filename=file.path(out.dir, 'hanoi_occupations.png'),
+       plot=pg.size.boot.plot,
+       width=6, height=4)
+
+pg.size.boot.plot
+```
+```{r pg-size-table}
+saveRDS(pg.size.boot.agg.withtot %>% arrange(occupation),
+        file=file.path(out.dir, "hanoi_occupation_estimates.rds"))
+```
+
+# Plot number of reported connections to each group
+
+```{r hm-hists}
+hm.plots <- map(probe.gps,
+                function(gp, hm_data = svy) {
+                  
+                  toplot <- hm_data %>%
+                    select(matches(gp)) %>%
+                    select(-matches('know_any')) %>%
+                    gather(var, value) %>%
+                    tidyr::extract(var, c('group', 'dummy', 'tie'), "^(.*)(_var_)(.*)$") %>%
+                    select(-dummy)
+                  
+                  toplot.hist <- hm_data %>%
+                    select(matches(gp)) %>%
+                    select(-matches('know_any')) %>%
+                    gather(var, value) %>%
+                    tidyr::extract(var, c('group', 'dummy', 'tie'), "^(.*)(_var_)(.*)$") %>%
+                    select(-dummy) %>%
+                    mutate(value = ifelse(is.na(value) | value == 9999, -2, value)) %>%
+                    mutate(is_miss = factor(ifelse(value == -2, 'missing', 'not missing')))
+                  
+                  ## TODO - LEFT OFF HERE
+                  ## want to plot missing values offset and w/ a different color
+                  res.hist <- ggplot(toplot.hist) +
+                    geom_histogram(aes(x=value, fill=is_miss), 
+                                   binwidth=1, show.legend=FALSE) +
+                    facet_grid(~tie) +
+                    theme_minimal() +
+                    ggtitle(paste0(gp)) +
+                    expand_limits(x=c(-2,30)) +
+                    scale_fill_manual(values=c('not missing'="grey50", 'missing'="red")) +
+                    labs(caption="Missing/Refused plotted at -2")
+                  
+                  toplot.agg <- toplot %>%
+                    group_by(tie) %>%
+                    summarise(y.bar = mean(value, na.rm=TRUE),
+                              y.sd = sd(value, na.rm=TRUE)) %>%
+                    mutate(group=gp)
+                  
+                  res.agg <- ggplot(toplot.agg, aes(x=tie, y=y.bar)) +
+                    geom_point() + geom_line(aes(group=1)) +
+                    expand_limits(y=0) + 
+                    theme_minimal() +
+                    ylab("Average num. reported connections") +
+                    ggtitle(paste0(gp, " (preliminary)"))
+                  
+                  return(list(hist=res.hist,
+                              agg=res.agg,
+                              agg.dat=toplot.agg))
+                })
+names(hm.plots) <- probe.gps
+```
+
+```{r}
+## save detailed histograms
+plots.tosave <- marrangeGrob(map(hm.plots, ~.x$hist), nrow=1, ncol=1)
+ggsave(filename=file.path(out.dir, 'hanoi_howmany_hist_bytie.pdf'),
+       plot=plots.tosave)
+ggsave(filename=file.path(out.dir, 'hanoi_howmany_hist_bytie.png'),
+       plot=plots.tosave)
+
+saveRDS(plots.tosave, file=file.path(out.dir, "howmany_plots.rds"))
+
+## save aggregate plots
+plots.tosave <- marrangeGrob(map(hm.plots, ~.x$agg), nrow=1, ncol=1)
+ggsave(filename=file.path(out.dir, 'hanoi_howmany_avg_bytie.pdf'),
+       plot=plots.tosave)
+ggsave(filename=file.path(out.dir, 'hanoi_howmany_avg_bytie.png'),
+       plot=plots.tosave)
+```
+
+```{r plot-avg-conns}
+## plot probe group connections 
+toplot <- map_df(hm.plots, ~.$agg.dat) %>% 
+  filter(group %in% nonhp.gps) %>%
+  mutate(group = nonhp_pretty(.x=group)) %>%
+  mutate(tie = tie_pretty(.x=tie))
+
+
+agg.plot <- ggplot(toplot,
+                   aes(x=tie, y=y.bar, color=group)) +
+  geom_point(aes(color=group, shape=group), size=4) + 
+  geom_line(aes(group=group)) +
+  expand_limits(y=0) + 
+  theme_minimal() +
+  xlab('') + 
+  ylab("Average number of reported connections") +
+  scale_shape_manual(values=1:19) +
+  labs(color='', shape='') +
+  guides(color=guide_legend(nrol=2, name=''), shape=guide_legend(nrol=2, name='')) +
+  theme(legend.position='bottom', legend.direction='horizontal')
+agg.plot
+
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_bytie.pdf'),
+       plot=agg.plot)
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_bytie.png'),
+       plot=agg.plot)
+
+# easier to read on log scale
+
+agg.plot.log <- agg.plot + scale_y_log10() + ylab("Average number of reported contacts\n(Log scale)")
+
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_bytie_log.pdf'),
+       plot=agg.plot.log)
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_bytie_log.png'),
+       plot=agg.plot.log)
+
+agg.plot.log
+```
+
+Get rank correlation matrix
+
+```{r}
+## plot probe group connections 
+cormat <- map_df(hm.plots, ~.$agg.dat) %>% 
+  filter(group %in% nonhp.gps) %>%
+  mutate(group = nonhp_pretty(.x=group)) %>%
+  mutate(tie = tie_pretty(.x=tie)) %>%
+  #group_by(tie) %>%
+  #nest()
+  #mutate(cor = map(data, ~cor.test(.x$y.bar, method='spearman')))
+  pivot_wider(names_from = tie,
+              values_from = y.bar,
+              id = group) %>%
+  select(-group) %>%
+  cor(method='spearman')
+
+glue::glue("
+           Minimum pairwise rank correlation: {mincor}
+           
+           ",
+           mincor = round(min(cormat), 2))
+
+cormat
+```
+
+
+
+```{r plot-avg-conns-qoi}
+## plot probe group connections 
+toplot <- map_df(hm.plots, ~.$agg.dat) %>% 
+  filter(group %in% hp.gps) %>%
+  mutate(group = qoi_pretty(.x=group)) %>%
+  mutate(tie = tie_pretty(.x=tie))
+
+
+agg.qoi.plot <- ggplot(toplot,
+                   aes(x=tie, y=y.bar, color=group)) +
+  geom_point(aes(color=group, shape=group), size=4) + 
+  geom_line(aes(group=group)) +
+  expand_limits(y=0) + 
+  theme_minimal() +
+  xlab('') + 
+  ylab("Average number of reported connections") +
+  scale_shape_manual(values=1:19) +
+  labs(color='', shape='') +
+  guides(color=guide_legend(nrol=2, name=''), shape=guide_legend(nrol=2, name='')) +
+  theme(legend.position='bottom', legend.direction='horizontal')
+agg.qoi.plot
+
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_qoi_bytie.pdf'),
+       plot=agg.qoi.plot)
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_qoi_bytie.png'),
+       plot=agg.qoi.plot)
+
+# easier to read on log scale
+
+agg.qoi.plot.log <- agg.qoi.plot + scale_y_log10() + 
+  ylab("Average number of reported contacts\n(Log scale)")
+
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_qoi_bytie_log.pdf'),
+       plot=agg.qoi.plot.log)
+ggsave(filename=file.path(out.dir, 'hanoi_avg_conns_qoi_bytie_log.png'),
+       plot=agg.qoi.plot.log)
+
+agg.qoi.plot.log
+```
+
+Look at scaling across ties
+
+```{r avgconn-scaling}
+# TODO - can't get the recodes to work nicely; want the x axis categories
+# to be \frac style latex expressions
+ratiorecodes <- c('ratio_any_to_cc' = TeX("$\\frac{\text{Any contact}{Conversational}$"),
+                  'ratio_cc_to_meal' = 'cc/meal',
+                  'ratio_meal_to_month' = 'meal/month')
+
+#ratio_pretty <- purrr::partial(dplyr::recode,
+#                               !!!ratiorecodes)
+
+## plot probe group connections 
+toplot <- map_df(hm.plots, ~.$agg.dat) %>% 
+  pivot_wider(id_cols = group,
+              names_from = tie,
+              values_from = y.bar) %>%
+  mutate(ratio_any_to_cc = cc_12mo / any,
+         ratio_cc_to_meal = meal_12mo / cc_12mo,
+         ratio_meal_to_month = meal_month / meal_12mo) %>%
+  select(group, starts_with('ratio')) %>%
+  pivot_longer(starts_with('ratio'),
+               names_to = 'qty',
+               values_to = 'ratio') %>%
+  mutate(is_hidden = case_when(group %in% hp.gps ~ 'hidden',
+                               TRUE ~ 'not hidden')) %>%
+  mutate(group = nonhp_pretty(.x=group)) %>%
+  mutate(group = qoi_pretty(.x=group)) 
+#%>%
+#  mutate(qty = factor(qty, levels=ratiorecodes))
+  
+  
+  #filter(group %in% nonhp.gps) %>%
+  #mutate(group = nonhp_pretty(.x=group)) %>%
+  #mutate(tie = tie_pretty(.x=tie))
+
+
+scaling.plot <- ggplot(toplot,
+                   aes(x=qty, y=ratio, color=group)) +
+                   #aes(x=qty, y=ratio, color=is_hidden)) +
+  geom_point(aes(color=group, shape=group), size=4) + 
+  #geom_point(aes(color=is_hidden, shape=group), size=4) + 
+  geom_line(aes(group=group)) +
+  theme_minimal() +
+  xlab('') + 
+  ylab("Scaling ratio") +
+  scale_shape_manual(values=1:19) +
+  labs(color='', shape='') +
+  guides(color=guide_legend(nrol=2, name=''), shape=guide_legend(nrol=2, name='')) +
+  facet_wrap(~ is_hidden) +
+  theme(legend.position='bottom', legend.direction='horizontal')
+
+scaling.plot
+
+```
+
+
+### Plot estimate pg size and estimate pg num contacts
+
+
+```{r pgsize-avgconns-plot}
+## plot probe group connections 
+ard.pg <- map_df(hm.plots, ~.$agg.dat) %>% 
+  filter(group %in% nonhp.gps) %>%
+  mutate(group = nonhp_pretty(.x=group)) %>%
+  mutate(tie = tie_pretty(.x=tie))
+
+comp.pg <- ard.pg %>%
+  left_join(pg.size.boot.agg %>% rename(group=occupation),
+            by='group')
+
+pgsize.avgconns.plot <- comp.pg %>%
+  #filter(! group %in% c("Rice farmer", 'Student')) %>%
+  ggplot(.) +
+  geom_point(aes(x=size_estimate_mean, y=y.bar)) +
+  #geom_text_repel(aes(x=size_estimate_mean, y=y.bar, label=group)) +
+  theme_minimal() +
+  scale_x_continuous(labels=scales::comma) +
+  facet_wrap(~ tie, scales='free_y') +
+  xlab("Estimated probe group size") +
+  ylab("Average number of reported connections")
+
+ggsave(filename=file.path(out.dir, 'hanoi_pgsize_avg_conns.pdf'),
+       plot=pgsize.avgconns.plot)
+ggsave(filename=file.path(out.dir, 'hanoi_pgsize_avg_conns.png'),
+       plot=pgsize.avgconns.plot)
+
+pgsize.avgconns.plot
+```
+
+
+### Summarize missingness for all network report questions
+
+```{r}
+num_rows <- nrow(svy)
+
+misschk <- svy %>% 
+  select(matches(probe.gps)) %>%
+  summarize_each(funs(sum(is.na(.)))) %>%
+  pivot_longer(cols=everything(),
+               names_to = "variable",
+               values_to = "num_missing") %>%
+  mutate(pct_missing = 100 * (num_missing / num_rows))
+
+misschk_probeonly <- svy %>% 
+  select(matches(probe.gps)) %>%
+  select(-matches(hp.gps)) %>%
+  summarize_each(funs(sum(is.na(.)))) %>%
+  pivot_longer(cols=everything(),
+               names_to = "variable",
+               values_to = "num_missing") %>%
+  mutate(pct_missing = 100 * (num_missing / num_rows))
+
+glue::glue("
+           
+           Missingness is low - at the most, it is about {round(max(pct_missing))}% for some of
+           the hidden population variables.
+           
+           For probe groups alone, missingness is about {round(max(probe_pct_missing))}% at most.
+           
+           ",
+           pct_missing = misschk$pct_missing,
+           probe_pct_missing = misschk_probeonly$pct_missing)
+
+misschk
+```
+
+tie_pretty
+nonhp_pretty
+qoi_recodes
+
+Make a table which we can show in the paper
+
+```{r}
+
+misstab_dat <- misschk %>% 
+       tidyr::extract(variable, 
+                      c('group', 'dummy', 'tie'), 
+                      "^(.*)(_var_)(.*)$") %>%
+       select(-dummy) %>%
+       filter(! is.na(group))
+
+misstab <- misstab_dat %>%
+  select(-num_missing) %>%
+  mutate(self = ifelse(group %in% hp.gps, 'Yes', 'No')) %>%
+  mutate(group = nonhp_pretty(group)) %>%
+  mutate(group = qoi_pretty(group)) %>%
+  mutate(tie = tie_pretty(tie)) %>%
+  rename(Group=group,
+         `Self administered`=self) %>%
+  pivot_wider(names_from=tie,
+              values_from=pct_missing)
+
+saveRDS(misstab,
+        file=file.path(out.dir, "hanoi_missingness_table.rds"))
+```
+
+
+
+## Calculate design-based estimated network sizes
+
+Calculate the total number of reported connections to the probe alters for each tie
+
+```{r calc-pg-tot}
+## get total reported conns to all probe alters 
+## (except doctors, since no respondents reported being doctors) 
+pg.touse <- nonhp.gps[-match(c('doctor'), nonhp.gps)]
+
+pretty.pg.touse <- nonhp_pretty(.x=pg.touse)
+
+# is the respondent in a probe group?
+svy <- svy %>% mutate(in_pg = as.numeric(occupation %in% pretty.pg.touse))
+
+#all.pa <- unique(pa_var_dat$group)
+all.ties <- c('any', 'cc_12mo', 'meal_12mo', 'meal_month')
+
+# total number of connections to probe groups
+pa_tot_tie <- function(cur.tie, pg=pg.touse, pa_prefix='pa_tot_') {
+  
+   cur.pa.vars <- paste0(pg, "_var_", cur.tie)
+   
+   tmp <- svy %>% select(cur.pa.vars)
+   
+   tmp <- svy %>% 
+     rowwise() %>%
+     do(data.frame(cur.pa.tot = sum(unlist(.[cur.pa.vars]))))
+   
+   colnames(tmp) <- paste0(pa_prefix, cur.tie)
+   
+   return(tmp)
+}
+
+res <- map(all.ties,
+           pa_tot_tie,
+           pg=pg.touse) 
+res <- map(res, ungroup) %>% do.call('cbind', .)
+
+
+## NB: there are a few NA values in the total reported connections...
+
+## add total reported connections for each tie to the dataset
+svy <- cbind(svy, res)
+   
+```
+
+First get point estimates
+
+```{r}
+weighted.mean <- surveybootstrap:::weighted.mean
+
+get.degrees <- function(cur.tie, wgt, df, pa_prefix='pa_tot_', ego_pg='in_pg') {
+  
+  cur.pa.var <- paste0(pa_prefix, cur.tie)
+  
+  y.hat.F.A <- sum(df[, cur.pa.var] * df[, wgt], na.rm=TRUE)
+  
+  # TODO - handle this more elegantly
+  #N.A.hat <- sum(as.numeric(df$a7 != 'OTHER') * df[,wgt], na.rm=TRUE) 
+  N.A.hat <- sum(as.numeric(df[[ego_pg]]) * df[,wgt], na.rm=TRUE) 
+  
+  dbar.hat.F.F <- y.hat.F.A / N.A.hat
+  
+  return(data.frame(tie = cur.tie,
+                    y.hat.F.A = y.hat.F.A,
+                    N.A.hat = N.A.hat,
+                    dbar.hat.F.F = dbar.hat.F.F))
+}
+
+
+args <- expand.grid(tie=all.ties)
+args$idx <- 1:nrow(args)
+
+degree.estimates <- args %>%
+  split(.$idx) %>%
+  map_df(~ get.degrees(.x$tie, 'weight', svy, pa_prefix='pa_tot_', ego_pg='in_pg'))
+
+deg.plot <- ggplot(degree.estimates) +
+  geom_point(aes(x=tie, y=dbar.hat.F.F)) +
+  expand_limits(y=0) +
+  ylab("Estimated average network size (preliminary)") +
+  theme_minimal()
+deg.plot
+```
+
+Then add uncertainty estimates
+
+```{r}
+
+args <- expand.grid(tie=all.ties)
+args$idx <- 1:nrow(args)
+
+svy.w <- svy %>% left_join(analysisweights, by='id')
+
+num.reps <- ncol(analysisweights) - 1
+
+tic('Bootstrap degree estimates')
+boot.degree.estimates <-
+  map_df(1:num.reps,
+         function(idx) {
+           
+            cur.wgt <- paste0('analysis_weight_', idx)
+              
+            cur.degree.estimates <- args %>%
+              split(.$idx) %>%
+              map_df(~ get.degrees(.x$tie, cur.wgt, svy.w))
+            
+            cur.degree.estimates$idx <- idx
+            
+            return(cur.degree.estimates)
+         })
+toc()
+
+# summarize results
+boot.deg.agg <- boot.degree.estimates %>%
+  group_by(tie) %>%
+  summarize(dbar_hat_mean = mean(dbar.hat.F.F),
+            dbar_hat_ci_low = quantile(dbar.hat.F.F, .025),
+            dbar_hat_ci_high = quantile(dbar.hat.F.F, .975),
+            dbar_hat_stderr = sd(dbar.hat.F.F))
+
+```
+
+```{r}
+tie_pretty <- purrr::partial(dplyr::recode,
+                             'any'='Any contact',
+                             'cc_12mo'='Conversational\ncontact',
+                             'meal_12mo'='Shared a meal\nin last 12 mo.',
+                             'meal_month'='Shared a meal\nin last month')
+
+boot.deg.plot <- 
+  boot.deg.agg %>% 
+  ungroup() %>%
+  mutate(tie = tie_pretty(.x=tie)) %>%
+  ggplot(.) +
+  geom_pointrange(aes(x=tie, 
+                      y=dbar_hat_mean,
+                      ymin=dbar_hat_ci_low,
+                      ymax=dbar_hat_ci_high)) +
+  expand_limits(y=0) +
+  xlab("") +
+  ylab("Estimated average network size") +
+  theme_minimal()
+
+ggsave(filename=file.path(out.dir, 'hanoi_degree_estimates.pdf'),
+       plot=boot.deg.plot)
+ggsave(filename=file.path(out.dir, 'hanoi_degree_estimates.png'),
+       plot=boot.deg.plot)
+
+boot.deg.plot +
+  geom_point(aes(x=tie,
+                 y=dbar.hat.F.F),
+             color='blue',
+             data=degree.estimates %>% mutate(tie=tie_pretty(.x=tie)))
+```
+
+
+# Hidden population size estimates
+
+
+```{r}
+
+get.estimate <- function(cur.qoi, cur.tie, wgt, df, pa_prefix = 'pa_tot_', ego_pg='in_pg') {
+  
+  cur.qoi.var <- paste0(cur.qoi, "_var_", cur.tie)
+  cur.pa.var <- paste0(pa_prefix, cur.tie)
+  
+  num.miss <- sum(is.na(df[,cur.qoi.var]))
+  num.nonmiss <- sum(! is.na(df[,cur.qoi.var]))
+  pct.miss <- 100 * (num.miss / nrow(df))
+  
+  y.hat.F.H <- sum(df[, cur.qoi.var] * df[, wgt], na.rm=TRUE)
+  
+  y.hat.F.A <- sum(df[, cur.pa.var] * df[, wgt], na.rm=TRUE)
+  
+  N.A.hat <- sum(as.numeric(df[[ego_pg]]) * df[,wgt], na.rm=TRUE) 
+  
+  dbar.hat.F.F <- y.hat.F.A / N.A.hat
+  
+  return(data.frame(qoi = cur.qoi,
+                    tie = cur.tie,
+                    y.hat.F.H = y.hat.F.H,
+                    y.hat.F.A = y.hat.F.A,
+                    N.A.hat = N.A.hat,
+                    dbar.hat.F.F = dbar.hat.F.F,
+                    N.H.hat = y.hat.F.H / dbar.hat.F.F,
+                    pct.miss = pct.miss))
+}
+
+all.qois <- c('fsw', 'msm', 
+              'drug_injectors', 'drug_users',
+              'women_smoke', 'women_babies')
+
+args <- expand.grid(tie=all.ties,
+                    qoi=all.qois)
+args$idx <- 1:nrow(args)
+
+ests <- args %>%
+  split(.$idx) %>%
+  map_df(~ get.estimate(.x$qoi, .x$tie, 'weight', svy.w))
+
+
+
+est.plot <-
+  ests %>% 
+  filter(qoi != 'women_babies') %>%
+  ggplot(.) +
+  geom_point(aes(x=tie, y=N.H.hat)) +
+  expand_limits(y=0) +
+  ylab("Estimated group size (preliminary)") +
+  xlab("") +
+  facet_grid(~ qoi) +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=90),
+        legend.position='bottom')
+est.plot
+
+#ggsave(filename=file.path(out.dir, 'hanoi_estimates.pdf'),
+#       plot=est.plot)
+
+
+```
+
+And add uncertainty estimates
+
+
+```{r}
+args <- expand.grid(tie=all.ties)
+args$idx <- 1:nrow(args)
+
+svy.w <- svy %>% left_join(analysisweights, by='id')
+
+num.reps <- ncol(analysisweights) - 1
+
+all.qois <- c('fsw', 'msm', 
+              'drug_injectors', 'drug_users',
+              'women_smoke', 'women_babies')
+
+args <- expand.grid(tie=all.ties,
+                    qoi=all.qois)
+args$idx <- 1:nrow(args)
+
+tic('Bootstrap size estimates')
+boot.ests <-
+  map_df(1:num.reps,
+         function(rep.idx) {
+           
+            cur.wgt <- paste0('analysis_weight_', rep.idx)
+            
+            cur.ests <- args %>%
+              split(.$idx) %>%
+              map_df(~ get.estimate(.x$qoi, .x$tie, cur.wgt, svy.w))              
+
+            cur.ests$idx <- rep.idx
+            
+            return(cur.ests)
+         })
+toc()
+```
+
+
+
+```{r}
+# summarize results
+boot.est.agg <- boot.ests %>%
+  group_by(qoi, tie) %>%
+  summarize(Nhat_mean = mean(N.H.hat),
+            Nhat_ci_low = quantile(N.H.hat, .025),
+            Nhat_ci_high = quantile(N.H.hat, .975),
+            Nhat_stderr = sd(N.H.hat))
+  
+```
+
+TODO - left off here
+these numbers seem surprisingly low
+the checks that are being developed below, based on babies and women who smoke,
+suggest this as well. is there something structural going on?
+
+```{r}
+boot.est.plot <- ggplot(boot.est.agg %>% 
+                          filter(qoi != 'women_babies') %>%
+                          ungroup() %>%
+                          mutate(qoi = qoi_pretty(.x=qoi),
+                                 tie = tie_pretty(.x=tie))) +
+#boot.est.plot <- ggplot(boot.est.agg) +
+  geom_pointrange(aes(x=tie, 
+                      y=Nhat_mean,
+                      ymin=Nhat_ci_low,
+                      ymax=Nhat_ci_high)) +
+  expand_limits(y=0) +
+  ylab("Estimated group size") +
+  facet_grid(~ qoi) +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=90, hjust=1))
+
+ggsave(filename=file.path(out.dir, 'prelim_hanoi_estimates_withci.pdf'),
+       plot=boot.est.plot)
+ggsave(filename=file.path(out.dir, 'prelim_hanoi_estimates_withci.png'),
+       plot=boot.est.plot)
+
+boot.est.plot
+```
+
+# Model-based estimates
+
+### Prep for model fits
+
+```{r}
+svy.wocc <- svy %>%
+  mutate(occupation = case_when(a7 == "BANK WORKER" ~ "bank_worker",
+                                a7 == "BUILDER/MASON" ~ "builder",
+                                a7 == "COFFEESHOP OWNER" ~ "cafe_owner",
+                                a7 == "FARMER (RICE GROWER ONLY)" ~ "farmer",
+                                a7 == "HAIRDRESSER" ~ "hairdresser",
+                                a7 == "LAWYER" ~ "lawyer",
+                                a7 == "NURSE" ~ "nurse",
+                                a7 == "OTHER" ~ "other",
+                                a7 == "PRIMARY TEACCHER" ~ "primary_teacher",
+                                a7 == "SECURITY GUARD" ~ "security_guard",
+                                a7 == "STUDENT" ~ "student",
+                                a7 == "TAXI DRIVER" ~ "taxi_driver",
+                                a7 == "XE OM DRIVER" ~ "xe_om_driver")) %>%
+  fastDummies::dummy_cols(select_columns='occupation') %>%
+  # NB: we had no doctors in the sample
+  mutate(occupation_doctor = 0)
+
+#table(tmp$occupation, useNA='ifany')
+svy.wocc
+```
+
+
+```{r}
+## NB: 2 responses to ARD questions are missing
+## these are for 'farmer_var_any'
+svy.formod <- svy.wocc %>%
+  #drop_na(all_of(paste0(nonhp.gps, "_var_any")))
+  ## NB: we're losing obs here...
+  drop_na(starts_with(nonhp.gps)) %>%
+  drop_na(starts_with(hp.gps))
+
+cur.tot.Z <- svy.formod %>%
+  select(all_of(paste0('occupation_', nonhp.gps))) %>%
+  colSums()
+
+cur.G <- length(nonhp.gps) 
+
+cur.K <- length(hp.gps)
+
+cur.n <- nrow(svy.formod)
+
+cur.N <- sum(svy$weight)
+
+# make a list whose entries are lists;
+# these inner lists have the data that need to be passed
+# to the model
+all.dfm <- setNames(map(probe.relations[-1],
+                      function(relation) {
+                        this.Y <- svy.formod %>%
+                          select(all_of(paste0(nonhp.gps, "_", relation)))
+                        
+                        this.X <- svy.formod %>%
+                          select(all_of(paste0(hp.gps, "_", relation)))
+                        
+                        this.dfm <-
+                          list(
+                               # respondent probe gp membership
+                               tot_Z = cur.tot.Z,
+                               # ARD for probe groups
+                               Y = this.Y,
+                               # ARD for hidden popns
+                               X = this.X,
+                               # number of probe gps
+                               G = cur.G,
+                               # number of hidden popn gps
+                               K = cur.K,
+                               # size of entire popn
+                               N = cur.N,
+                               # size of survey sample
+                               # (assumed for now to be SI sample)
+                               n = cur.n)
+                        
+                        return(this.dfm)
+                      }),
+                  probe.relations[-1])
+```
+
+
+```{r fit-degree-model-fn}
+model_degree_estimate <- 
+  function(model, data_for_model, name=NULL, 
+           overdisp=FALSE,
+           warmup=1000, iter=10001, chains=4, 
+           ...) {
+    
+    ############
+    ## sample from model
+    tic("Sampling from model")
+    model_fit <- sampling(model,
+                        data = data_for_model,
+                        warmup = warmup,
+                        iter = iter,
+                        chains = chains,
+                        ...)
+    toc()
+    
+    fit_summ <- rstan::summary(model_fit)
+    
+    # get posterior params for degree distn
+    mu_median <- model_fit %>% 
+      spread_draws(mu) %>%
+      median_qi(mu)
+    
+    sigma_median <- model_fit %>% 
+      spread_draws(sigma) %>%
+      median_qi(sigma)
+    
+    # get posterior estimates of average degree 
+    mean_degree_median <- model_fit %>% 
+      spread_draws(mean_degree) %>%
+      median_qi(mean_degree)
+    
+    # get posterior estimates of variance in degree 
+    var_degree_median <- model_fit %>% 
+      spread_draws(var_degree) %>%
+      median_qi(var_degree)
+    
+    # get posterior median individual degrees
+    d_median <- model_fit %>% 
+      spread_draws(d[rownum]) %>%
+      median_qi(d)
+    
+    # get posterior probe group size estimates 
+    p_g_median <- model_fit %>% 
+      spread_draws(p_g[rownum]) %>%
+      median_qi(p_g)
+    
+    p_k_median <- model_fit %>% 
+      spread_draws(p_k[rownum]) %>%
+      median_qi(p_k)
+    
+    res <- list(fit = model_fit,
+                model_data = data_for_model,
+                post_mu_median = mu_median,
+                post_sigma_median = sigma_median,
+                post_mean_degree_median = mean_degree_median,
+                post_var_degree_median = var_degree_median,
+                post_d_median = d_median,
+                post_p_g_median = p_g_median,
+                post_p_k_median = p_k_median,
+                name=name)
+    
+    if(overdisp) {
+      
+      # get posterior overdispersion parameter estimates 
+      omega_g_median <- model_fit %>% 
+        spread_draws(omega_g[rownum]) %>%
+        median_qi(omega_g)
+    
+      omega_k_median <- model_fit %>% 
+        spread_draws(omega_k[rownum]) %>%
+        median_qi(omega_k)
+      
+      res$post_omega_g_median <- omega_g_median
+      res$post_omega_k_median <- omega_k_median
+      
+    }
+    
+    return(res)
+}
+```
+
+### Compile the model
+
+```{r compile-model}
+###########
+## model_random_degree_estprobe estimates probe gp sizes
+rdestprobehp_model <- stan_model(file = file.path(code.dir, "92_model_random_degree_estprobe_hidden.stan"))
+```
+
+### Unweighted model estimates
+
+```{r run-degree-model}
+run_model <- TRUE
+
+if(run_model) {
+  # run the model
+  model_degree_res <- imap(all.dfm,
+                           ~ model_degree_estimate(rdestprobehp_model, .x, .y))
+  saveRDS(model_degree_res, file=file.path(out.dir, "hanoi_model_degree_res.rds"))
+} else {
+  # use previously run model results
+  model_degree_res <- readRDS(file=file.path(out.dir, "hanoi_model_degree_res.rds"))
+}
+```
+
+R-hats
+------
+
+```{r}
+post_rhats <- map_dfr(model_degree_res,
+                      ~ .x$fit %>% summary() %>%  pluck('summary') %>% as_tibble())
+
+post_rhats
+```
+
+```{r}
+summary(post_rhats$Rhat)
+```
+
+```{r}
+model_degree_ests <- map_df(model_degree_res,
+                            ~ .x$post_mean_degree_median %>% 
+                              mutate(tie = str_replace(.x$name, 'var_', ''),
+                                     dbar_hat_mean = mean_degree,
+                                     dbar_hat_ci_low = .lower,
+                                     dbar_hat_ci_high = .upper,
+                                     source = 'model') %>%
+                              select(tie, source, starts_with('dbar')))
+model_degree_ests
+```
+
+```{r}
+N.F <- sum(svy$weight)
+model_hp_ests <- map_df(model_degree_res,
+                            ~ .x$post_p_k_median %>% 
+                              mutate(tie = str_replace(.x$name, 'var_', ''),
+                                     qoi = hp.gps,
+                                     Nhat_mean = N.F*p_k,
+                                     Nhat_ci_low = N.F*.lower,
+                                     Nhat_ci_high = N.F*.upper,
+                                     source = 'model') %>%
+                              select(qoi, tie, source, starts_with('Nhat')))
+model_hp_ests
+```
+
+### Compare model to design
+
+```{r}
+model_design_degree_comp <- 
+  bind_rows(model_degree_ests,
+            boot.deg.agg %>% mutate(source='design'))
+```
+
+
+
+```{r plot-ties-model-and-design}
+fig.width <- 6
+fig.height <- 4
+
+tie_pretty <- purrr::partial(dplyr::recode,
+                             'any'='Any contact',
+                             'cc_12mo'='Conversational\ncontact',
+                             'meal_12mo'='Shared a meal\nin last 12 mo.',
+                             'meal_month'='Shared a meal\nin last month')
+
+mdcomp.deg.plot <- ggplot(model_design_degree_comp %>%
+                          mutate(tie = tie_pretty(.x=tie))) + 
+  geom_pointrange(aes(x=tie, 
+                      y=dbar_hat_mean,
+                      ymin=dbar_hat_ci_low,
+                      ymax=dbar_hat_ci_high,
+                      color=source),
+                  position=position_dodge(width=.4)) +
+  expand_limits(y=0) +
+  xlab("") +
+  ylab("Estimated average network size") +
+  theme_minimal() +
+  theme(legend.position='bottom') +
+  scale_color_discrete(name="Estimate source") +
+  NULL
+
+ggsave(filename=file.path(out.dir, 'hanoi_degree_estimates.pdf'),
+       plot=mdcomp.deg.plot,
+       width=fig.width,
+       height=fig.height)
+ggsave(filename=file.path(out.dir, 'hanoi_degree_estimates.png'),
+       plot=mdcomp.deg.plot,
+       width=fig.width,
+       height=fig.height)
+
+mdcomp.deg.plot
+
+#boot.deg.plot +
+#  geom_point(aes(x=tie,
+#                 y=dbar.hat.F.F),
+#             color='blue',
+#             data=degree.estimates %>% mutate(tie=tie_pretty(.x=tie)))
+```
+
+```{r}
+model_design_hp_comp <- 
+  bind_rows(model_hp_ests,
+            boot.est.agg %>% mutate(source='design'))
+```
+
+(We'll plot the final estimates after calculating some checks)
+
+## Checks 
+
+
+## Estimate number of women who smoke in Hanoi
+
+Nga sent information from Ha Noi Preventative Medicine Center, specific to Hanoi.
+Smoking rates among women are:
+
+* 18-44: 0.57% (0.21% - 1.51%)
+* 45-69: 0.42% (0.15% - 1.12%)
+
+```{r}
+smoke_est <- popn_dat %>% filter(sex=='female') %>% filter(frame.sum.wt > 0) %>% arrange(age)
+
+smoke_est <- smoke_est %>%
+  mutate(# any tobbacco
+         smoke_rate = ifelse(age %in% c('15-19', '20-24', '25-29', '30-34', '35-39', '40-44'), 
+                             0.57/100, 
+                             NA),
+         smoke_rate = ifelse(age %in% c('45-49', '50-54'), 
+                             0.42/100, smoke_rate),
+         # lower bound of CI
+         smoke_rate_low = ifelse(age %in% c('15-19', '20-24', '25-29', '30-34', '35-39', '40-44'), 
+                             0.21/100, 
+                             NA),
+         smoke_rate_low = ifelse(age %in% c('45-49', '50-54'), 
+                             0.15/100, smoke_rate),
+         # upper bound of CI
+         smoke_rate_high = ifelse(age %in% c('15-19', '20-24', '25-29', '30-34', '35-39', '40-44'), 
+                             1.51/100, 
+                             NA),
+         smoke_rate_high = ifelse(age %in% c('45-49', '50-54'), 
+                             1.12/100, smoke_rate),
+         smoke_num = estimate * frame.sum.wt * smoke_rate,
+         smoke_num_low = estimate * frame.sum.wt * smoke_rate_low,
+         smoke_num_high = estimate * frame.sum.wt * smoke_rate_high,
+         )
+
+women_smoke_est <- sum(smoke_est %>% pull(smoke_num))
+women_smoke_est_low <- sum(smoke_est %>% pull(smoke_num_low))
+women_smoke_est_high <- sum(smoke_est %>% pull(smoke_num_high))
+cat(glue::glue("Estimated number of women who smoke (Hanoi): {women_smoke_est}.\n\n"))
+cat(glue::glue("Estimated number of women who smoke (Hanoi): ({women_smoke_est_low} - {women_smoke_est_high})."))
+```
+
+
+## Estimate number of women with babies in Hanoi
+
+```{r}
+est_popn_u4 <- popn_dat %>% filter(sex=='both', age=='0-4') %>% pull(estimate)
+est_women_babies <- popn_dat %>% filter(sex=='both', age=='0-4') %>% pull(estimate) / 5
+cat(glue::glue("Estimated number of children under 5 in Hanoi: {est_popn_u4}.\n\n"))
+cat(glue::glue("Estimated number of women with babies under 1 in Hanoi: {est_women_babies}.\n\n"))
+```
+
+### plot estimates
+
+```{r estimates-plot-both}
+fig.height <- 5
+fig.width  <- 7
+
+
+comparison_dat <- tribble(~qoi, ~val, ~val_low, ~val_high,
+                          'Women who had a baby\nin the past 12mo', est_women_babies, NA, NA,
+                          'women_smoke'='Women who smoke', women_smoke_est, women_smoke_est_low, women_smoke_est_high) 
+
+mdcomp.est.plot <- 
+  model_design_hp_comp %>% 
+  #filter(qoi != 'women_babies') %>%
+  ungroup() %>%
+  mutate(qoi = qoi_pretty(.x=qoi),
+         tie = tie_pretty(.x=tie)) %>%
+  ggplot(.) +
+  geom_hline(aes(yintercept=val),
+             lty=3,
+             #color='darkgrey',
+             data=comparison_dat) +
+  geom_pointrange(aes(x=tie, 
+                      y=Nhat_mean,
+                      ymin=Nhat_ci_low,
+                      ymax=Nhat_ci_high,
+                      color=source),
+                  position=position_dodge(width=.4)) +
+  expand_limits(y=0) +
+  ylab("Estimated group size") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=90, hjust=1)) + 
+  facet_wrap(~ qoi, scales='free_y') +
+  scale_y_continuous(label=scales::comma) +
+  scale_color_discrete(name="Estimate source") +
+  xlab("") +
+  theme(legend.position='bottom') +
+  NULL
+
+ggsave(filename=file.path(out.dir, 'hanoi_estimates_designmodel_withci.pdf'),
+       plot=mdcomp.est.plot,
+       height=fig.height,
+       width=fig.width)
+ggsave(filename=file.path(out.dir, 'hanoi_estimates_designmodel_withci.png'),
+       plot=mdcomp.est.plot,
+       height=fig.height,
+       width=fig.width)
+
+mdcomp.est.plot
+```
+
+Tables w/ estimates and uncertainty for appendix
+
+```{r est-tables}
+pp <- function(x, dig=0) {
+  format(round(x,dig), big.mark=',')
+}
+
+qoi_tab <-
+  model_design_hp_comp %>%
+  mutate(Nhat_ci_width = (Nhat_ci_high - Nhat_ci_low),
+         rel_ci_width = Nhat_ci_width / Nhat_mean)  %>%
+  mutate(rec_ci_width = case_when(is.nan(rel_ci_width) ~ NA_real_,
+                                  TRUE ~ rel_ci_width)) %>%
+  mutate(str_est = glue::glue("
+                              {pp(Nhat_mean)} ({pp(Nhat_ci_low)} - {pp(Nhat_ci_high)}) 
+                              "),
+         str_ci  = glue::glue("
+                              ({pp(Nhat_ci_low)} - {pp(Nhat_ci_high)}) 
+                              "),
+         str_relci = glue::glue("
+                              {rcwval} 
+                              ",
+                              rcwval=ifelse(! is.nan(rel_ci_width), pp(rel_ci_width,2), "--"))
+         ) %>%
+  select(qoi, tie, source, starts_with('str')) 
+
+est_tab <- qoi_tab %>%
+  select(qoi, tie, source, str_est) %>%
+  mutate(tie = tie_pretty(.x = tie),
+         qoi = qoi_pretty(.x = qoi)) %>%
+  pivot_wider(names_from = tie,
+              values_from = starts_with('str'))
+  #mutate(qoi = qoi_pretty(.x=qoi),
+  #         tie = tie_pretty(.x=tie))
+
+est_tab
+
+relci_tab <- qoi_tab %>%
+  select(qoi, tie, source, str_relci) %>%
+  mutate(tie = tie_pretty(.x = tie),
+         qoi = qoi_pretty(.x = qoi)) %>%
+  pivot_wider(names_from = tie,
+              values_from = starts_with('str'))
+  #mutate(qoi = qoi_pretty(.x=qoi),
+  #         tie = tie_pretty(.x=tie))
+
+saveRDS(est_tab,
+        file=file.path(out.dir, "hanoi_qoi_estimates.rds"))
+saveRDS(relci_tab,
+        file=file.path(out.dir, "hanoi_qoi_relci.rds"))
+
+est_tab
+relci_tab
+```
+

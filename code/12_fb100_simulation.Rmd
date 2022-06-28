@@ -1,0 +1,251 @@
+---
+title: "Run FB100 simulation"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setglobal, tidy=FALSE, echo=FALSE}
+library(knitr)
+
+opts_chunk$set(out.width=600, out.height=600)
+library(tidyverse)
+library(glue)
+library(stringr)
+library(igraph)
+library(expm)
+library(combinat)
+library(ggraph)
+
+library(future)
+library(furrr)
+
+library(tidygraph)
+library(nrsimulatr)
+
+library(tictoc)
+
+library(here)
+```
+
+```{r dirs}
+root.dir <- here()
+
+data.out.dir <- file.path(root.dir, "data", "sim")
+out.dir <- file.path(root.dir, "out", "sim")
+```
+
+
+```{r}
+# load nr.censuses
+nr.censuses <- readRDS(file=file.path(data.out.dir, "fb100_censuses_perfect.rds"))
+# load num.cand.gps
+num.cand.gps <- readRDS(file=file.path(data.out.dir, "fb100_svy_num_cand_gps.rds"))
+```
+
+# Functions to implement the estimators
+
+```{r define-estimators}
+
+## first degree estimator is
+##    \widehat{y}(F, \mathcal{A}) / \widehat{N}_{\mathcal{A}}
+## this one is analogous to what we'd get using normal known popn method
+
+## NB: assumes there's a column called 'weight' in svy
+estimate_gp_sizes <- function(svy, gps) {
+  
+  res <- 
+    svy %>% 
+    select(weight, one_of(unlist(gps))) %>%
+    summarize_at(vars(-weight), .funs=list(~sum(. * weight)))
+  return(res)
+   
+}
+
+## NB: assumes there's a column called 'weight' in svy
+## NB: assumes gps don't have "y." yet
+estimate_tot_connections <- function(svy, gps) {
+  
+  y.gps <- paste0('y.', gps)
+  
+  res <- 
+    svy %>% 
+    select(weight, one_of(unlist(y.gps))) %>%
+    summarize_at(vars(-weight), .funs=list(~sum(. * weight)))
+  return(res)
+  
+}
+
+estimate_degree <- function(svy, gps) {
+  
+  gp.sizes.hat <- estimate_gp_sizes(svy, gps)  
+  probe.size.hat <- sum(gp.sizes.hat)
+  
+  conns.hat <-  estimate_tot_connections(svy, gps)
+  probe.conns.hat <- sum(conns.hat)
+  
+  frame.size.hat <- sum(svy %>% pull(weight))
+  
+  p.hat <- probe.size.hat / frame.size.hat
+  
+  # standard known popn estimator
+  dbar.hat <- probe.conns.hat / probe.size.hat
+  
+  # new one, derived above
+  dbar.new.hat <- (1 + ((1-p.hat)/p.hat)) * (probe.conns.hat/frame.size.hat)
+  
+  return(list(dbar.hat = dbar.hat,
+              dbar.new.hat = dbar.new.hat,
+              probe.size.hat = probe.size.hat,
+              probe.conns.hat = probe.conns.hat,
+              frame.size.hat = frame.size.hat))
+}
+
+#
+estimate_degree_kp <- function(svy, gps, probe.size.known) {
+  
+  conns.hat <-  estimate_tot_connections(svy, gps)
+  probe.conns.hat <- sum(conns.hat)
+  
+  dbar.hat <- probe.conns.hat / probe.size.known
+  
+  return(list(kp.dbar.hat = dbar.hat))
+}
+
+```
+
+# Simulation
+
+Using functions above, conduct a bunch of surveys...
+
+```{r survey-config}
+# number of cores to use
+num.cores <- 5
+
+# how many different sets of candidate groups to try
+num.sets.of.gps <- 20
+
+# number of candidate groups to take at a time
+num.gps <- 10
+
+# number of surveys per candidate group
+num.surveys <- 250
+
+# sample size of each survey
+cur.sample.size <- 500
+```
+
+Now actually run the surveys -- this is the step that takes a long time
+(about 5 hours)
+
+```{r run-surveys}
+if (num.cores > 1) {
+  plan(multiprocess, workers=num.cores)
+}
+
+set.seed(12345)
+
+tic("Simulating surveys...")
+
+## iterate over each
+##   school X group set X survey rep
+##
+## first map over schools
+svy.sim.out <- imap_dfr(nr.censuses,
+#svy.sim.out <- imap_dfr(nr.censuses[1:2],
+  function(cur.census, cur.school) {
+    
+    cat("Starting ", cur.school, "\n")
+    tic(glue::glue("... simulating {cur.school}"))
+    
+    # we won't need the visibilities
+    cur.census <- cur.census %>% select(-starts_with('v.'))
+    
+    # total population size in this school
+    cur.popn.size <- nrow(cur.census)
+    
+    # true population average degree in this school
+    true.cur.dbar <- mean(cur.census %>% pull(degree))
+    
+    all.cand.gps <- num.cand.gps %>% 
+                      filter(school==cur.school) %>%
+                      pull(candidate.names) %>%
+                      purrr::simplify()
+    
+    cur.gp.sets <- map(1:num.sets.of.gps,
+                       ~sample(all.cand.gps, size=num.gps, replace=FALSE))
+    
+    ## next map over sets of probe groups
+    res.over.cand.gps <- imap_dfr(cur.gp.sets,
+      function(cur.cand.gps, gp.set.idx) {
+        
+        # estimand
+        cur.estimand <- estimate_degree(cur.census %>% mutate(weight=1),
+                                        cur.cand.gps)
+        
+        cur.known.probe.size <- cur.estimand$probe.size.hat
+        
+        ## finally, map over surveys for each school X probe group set
+        svy.res <- map_dfr(1:num.surveys,
+              function(svy.idx) {
+                
+                ## simulate a survey
+                cur.respondents <- sample(1:cur.popn.size, cur.sample.size, replace=FALSE)
+                
+                cur.svy <- cur.census[cur.respondents,]
+                cur.svy <- cur.svy %>% 
+                  # weight is one over prob inclusion
+                  mutate(weight = cur.popn.size / cur.sample.size)
+                
+                cur.est <- estimate_degree(cur.svy, cur.cand.gps)
+                cur.est$sample.size <- cur.sample.size
+                cur.est$svy.index <- svy.idx
+                
+                cur.kp.est <- estimate_degree_kp(cur.svy, cur.cand.gps, cur.known.probe.size)
+                
+                cur.est$kp.dbar.hat <- cur.kp.est$kp.dbar.hat
+                
+                cur.est$sampled.row.idx <- list(cur.respondents) 
+                
+                return(cur.est)
+              })
+        
+        svy.res$estimand.dbar <- cur.estimand$dbar.hat
+        svy.res$estimand.all <- list(cur.estimand)
+        svy.res$gp.set <- list(cur.cand.gps)
+        svy.res$gp.set.idx <- gp.set.idx
+        
+        return(svy.res)
+        
+      })
+  
+      res.over.cand.gps$school <- cur.school    
+      res.over.cand.gps$true.dbar <- true.cur.dbar
+      
+      toc()
+      
+      return(res.over.cand.gps)
+  
+  })
+
+if (num.cores > 1) {
+  plan(sequential)
+}
+
+toc()
+
+tic("Saving simluation results...")
+#save(svy.sim.out,
+#     file=file.path(data.out.dir, "fb100_svy_sims.RData"))
+saveRDS(svy.sim.out, file=file.path(data.out.dir, "fb100_svy_sims.rds"))
+toc()
+```
+
+Sanity check
+
+```{r}
+glimpse(svy.sim.out)
+```
+

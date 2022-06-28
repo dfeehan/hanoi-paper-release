@@ -1,0 +1,354 @@
+---
+title: "Prep FB100 data for simulation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setglobal, tidy=FALSE, echo=FALSE}
+library(knitr)
+
+opts_chunk$set(out.width=600, out.height=600)
+library(tidyverse)
+library(stringr)
+library(igraph)
+library(expm)
+library(combinat)
+library(ggraph)
+
+library(R.matlab)
+
+library(tidygraph)
+library(nrsimulatr)
+
+library(here)
+library(tictoc)
+
+library(gt)
+library(gtsummary)
+```
+
+```{r}
+root.dir <- here()
+
+raw.data.dir <- file.path(root.dir, 'raw-data', "fb100", "facebook100")
+data.out.dir <- file.path(root.dir, "data", "sim")
+out.dir <- file.path(root.dir, "out", "sim")
+```
+
+From `facebook100_readme_021011.txt`:
+
+  Each of the school .mat files has an A matrix (sparse) and a
+  "local_info" variable, one row per node: a student/faculty status
+  flag, gender, major, second major/minor (if applicable), dorm/house,
+  year, and high school. Missing data is coded 0.
+
+## Function for prepping a network
+
+Turn the code above (which focused on one school at a time) into a function that will convert
+in general
+
+```{r prep-fn}
+zero.to.na <- function(x) {
+  #x[x==0] <- NA
+  return(x)
+}
+
+prep_fb100_network <- function(cur.school.name) {
+  
+  cat('starting ', cur.school.name, '\n')
+
+  cur.school <- readMat(file.path(raw.data.dir, paste0(cur.school.name, '.mat')))
+  
+  cur.school.att <- as_tibble(cur.school$local.info) %>%
+    select('status'=1, 'gender'=2, 'major'=3, 'minor'=4, 'dorm'=5, 'year'=6, 'high_school'=7) %>%
+    #mutate_all(zero.to.na) %>%
+    # NB: this means that we treat missing values (which are coded as 0)
+    # as their own category
+    mutate_all(as.character)
+  
+  cur.school.att <- cur.school.att %>%
+    mutate(school = cur.school.name)
+
+  cur.school.g <- graph_from_adjacency_matrix(cur.school$A, mode='undirected')
+  
+  for(cn in colnames(cur.school.att)) {
+    cur.school.g <- set_vertex_attr(cur.school.g, 
+                                    cn, 
+                                    1:nrow(cur.school.att), 
+                                    value=cur.school.att %>% pull(cn))
+  }
+  
+  return(cur.school.g)
+
+}
+
+```
+
+Go through and open up all of the FB100 networks.
+(This takes about 7 minutes on a 2020 Macbook Pro.)
+
+```{r prep-all-nets}
+all_net_names <- list.files(raw.data.dir, pattern="\\.*.mat")
+all_net_names <- str_replace(all_net_names, ".mat", "")
+
+all_net_names <- all_net_names[-match('schools', all_net_names)]
+
+## the naming pattern appears to be [SCHOOLNAME][ORDER],
+## where order is the sequence in which the school joined Facebook
+## (eg, Harvard is 1, then Columbia is 2, ...)
+tic("Loading all fb100 networks")
+fb100.networks <- map(all_net_names,
+                      prep_fb100_network)
+fb100.networks <- setNames(fb100.networks,
+                           all_net_names)
+
+saveRDS(fb100.networks,
+        file=file.path(data.out.dir, "fb100.rds"))
+toc()
+```
+
+# Simulate network reporting censuses on the fb100 networks
+
+Some helper functions
+
+```{r}
+## returns: graph with 'id' attribute added to each node
+add_ids  <- function(net) {
+  
+return(net %>%
+         activate(nodes) %>%
+         mutate(id=1:n()))
+
+}
+
+## add a variable with 'all' for the frame population
+add_all  <- function(net) {
+  
+return(net %>%
+         activate(nodes) %>%
+         mutate(all=1))
+
+}
+
+## NB: this assumes that nodes have an id attribute called 'id'
+## returns graph object with new attributes added to nodes
+factor_to_dummies <- function(net, fname) {
+  
+  fname <- ensym(fname)
+  
+  newcols <- net %>%
+    activate(nodes) %>%
+    as_tibble() %>%
+    ## see: https://adv-r.hadley.nz/evaluation.html
+    ## for more info
+    model.matrix(quo(!!fname - 1), .) %>%
+    as_tibble() %>%
+    mutate(id=1:n())
+  
+  ## join resulting dummy into original node df
+  net <- net %>%
+    activate(nodes) %>%
+    left_join(newcols, by='id')
+  
+  return(net)
+}
+
+get_dummy_names <- function(net, fname) {
+  allnames <- net %>%
+    activate(nodes) %>%
+    as_tibble() %>%
+    colnames()
+
+  dnames <- allnames[str_detect(allnames, paste0(fname, "\\d+"))]
+  
+  return(dnames)
+}
+
+fb100.perfect.reporting <- function(cur.net, fnames) {
+  
+  vnames <- map(fnames, ~get_dummy_names(cur.net, .)) %>% purrr::simplify()
+ 
+  # vnames are the names of the attributes to use for degree estimation
+  params <- list(groups=c(vnames, 'all'),
+                 gps.in.F = 'all',
+                 gps.in.H = 'all')
+    
+  ex.params <- nrsimulatr::existing_params(params)
+  
+  rep.params <- nrsimulatr::perfect_reporting()
+  
+  cur.g <- nrsimulatr::generate_graph(ex.params, cur.net)
+  
+  cur.r <- nrsimulatr::reporting_graph(rep.params, cur.g)
+  
+  return(cur.r)
+
+}
+```
+
+# Create census files
+
+Generate a census w/ network reporting data about each network.
+We'll 'collect' info on dorm, major, gender, year, and status.
+This takes about 50 minutes to run on a 2020 Macbook pro; it produces a datafile
+that is about 225 MB in size.
+
+
+```{r}
+tic("Getting censuses...")
+## make and save object w/ all censuses
+nr.censuses <- setNames(imap(fb100.networks,
+                        function(cur.g, school.name) {
+                          
+                          cat(paste0('starting ', school.name, '\n'))
+                          
+                          cur.g <-
+                            cur.g %>%
+                            as_tbl_graph() %>%
+                            add_ids() %>%
+                            add_all() %>%
+                            factor_to_dummies('status') %>%
+                            factor_to_dummies('year') %>%
+                            factor_to_dummies('gender') %>%
+                            factor_to_dummies('major') %>%
+                            factor_to_dummies('dorm') 
+                            # adding high_school makes this run super slowly
+                            #factor_to_dummies('high_school')
+                          
+                          cur.nr <- fb100.perfect.reporting(cur.g,
+                                                            c('status',
+                                                              'year',
+                                                              'gender',
+                                                              'major',
+                                                              'dorm'))
+                          
+                          res <- cur.nr %>%
+                            activate(nodes) %>%
+                            as_tibble()
+                          
+                          return(res)
+                          
+                        }),
+                        names(fb100.networks))
+
+saveRDS(nr.censuses,
+        file=file.path(data.out.dir, "fb100_censuses_perfect.rds"))
+toc()
+```
+
+
+Calculate the number of candidate groups for each network, as well as some summary statistics about group prevalence.
+This takes about 30 seconds.
+
+```{r}
+## get the prevalence of each trait
+tnames <- c('status', 'year', 'gender', 'major', 'dorm')
+
+tic("Calculating the number of candidate groups for each network...")
+num.cand.gps <- imap_dfr(nr.censuses,
+                        function(cur.census, cur.school) {
+                          
+          cat("Starting ", cur.school, "\n")
+                          
+          # get names of all possible traits
+          allnames <- colnames(cur.census %>% select(-starts_with("y."), -starts_with("v.")))
+          all.traits <- map(tnames, 
+                            ~ str_extract(allnames, paste0(., "\\d+"))) %>%
+                        purrr::simplify() %>%
+                        purrr::keep(! is.na(.)) 
+
+          # calculate the prevalence of each trait
+          cur.census.prev <- cur.census %>% 
+            summarise_at(.vars=all.traits, .funs=mean)
+          
+          
+          prev.df <- cur.census.prev %>%
+            gather(group, prev)
+          
+          prev.plot <- ggplot(prev.df) +
+            geom_histogram(aes(x=prev), binwidth=.005) +
+            theme_minimal() +
+            xlab("group prevalence") +
+            ggtitle(paste0(cur.school, " - (", length(all.traits), " groups)"))
+          
+          ## candidate groups have prevalence greater than 1% and less than 10%
+          cur.candidates <- cur.census.prev %>% 
+            purrr::keep(~ . >= 0.01 && . < 0.1)
+          
+          # calculate the mean prevalence across the candidate probe groups
+          mean.candidate.prev <-
+            prev.df %>% filter(prev >= 0.01, prev < 0.1) %>%
+            pull(prev) %>%
+            mean()
+
+          return(data_frame(school=cur.school,
+                            num.nodes=nrow(cur.census),
+                            num.traits=length(all.traits),
+                            num.candidates=length(cur.candidates),
+                            candidate.names=list(colnames(cur.candidates)),
+                            candidate.mean.prev = mean.candidate.prev,
+                            prev.plot = list(prev.plot),
+                            prev.df = list(prev.df)))
+          
+          })
+
+saveRDS(num.cand.gps,
+        file=file.path(data.out.dir, "fb100_svy_num_cand_gps.rds"))
+toc()
+```
+
+Make a table showing, for each school
+
+* avg / quantiles in number of nodes
+* avg / quantiles in number of candidate groups
+
+and a summary w/ the averages
+
+Make a table with each school, number of nodes, number of traits, and number of candidate groups
+
+```{r}
+num.cand.gps %>%
+  select(num.traits,
+         num.candidates,
+         candidate.mean.prev)
+```
+
+Make a table with avg/sd/quantiles of number of nodes and avg/sd/quantiles of number of candidate groups
+
+```{r}
+num.cand.gps %>%
+  select(num.nodes,
+         num.traits,
+         num.candidates,
+         candidate.mean.prev) %>%
+  tbl_summary(
+    label = list(num.nodes ~ "Number of people in network",
+                 num.traits ~ "Number of traits",
+                 num.candidates ~ "Number of candidate groups",
+                 candidate.mean.prev ~ "Average prevalence\nof candidate group")
+  ) %>%
+  modify_header(label ~ "School characteristic")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
