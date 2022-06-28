@@ -1,0 +1,9 @@
+data/*
+raw-data/*
+out/*
+.Rdata
+*.html
+pre-out/
+notes-*.md
+old_DESCRIPTION
+
